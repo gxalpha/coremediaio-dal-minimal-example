@@ -18,13 +18,17 @@
 //  along with CMIOMinimalSample. If not, see <http://www.gnu.org/licenses/>.
 
 #import "Stream.h"
-#import "Logging.h"
+
 #import <AppKit/AppKit.h>
 #import <mach/mach_time.h>
+#include <CoreMediaIO/CMIOSampleBuffer.h>
+
+#import "Logging.h"
 
 @interface Stream () {
     CMSimpleQueueRef _queue;
     CFTypeRef _clock;
+    NSImage *_testImage;
 }
 
 @property CMIODeviceStreamQueueAlteredProc alteredProc;
@@ -32,16 +36,22 @@
 @property (readonly) CMSimpleQueueRef queue;
 @property NSTimer *frameTimer;
 @property (readonly) CFTypeRef clock;
+@property UInt64 sequenceNumber;
+@property (readonly) NSImage *testImage;
 
 @end
 
 @implementation Stream
 
 - (void)dealloc {
+    DLog(@"Stream Dealloc");
     CMIOStreamClockInvalidate(_clock);
     CFRelease(_clock);
+    _clock = NULL;
     CFRelease(_queue);
+    _queue = NULL;
     [self.frameTimer invalidate];
+    self.frameTimer = nil;
 }
 
 - (void)startServingFrames {
@@ -69,12 +79,20 @@
 
 - (CFTypeRef)clock {
     if (_clock == NULL) {
-        OSStatus err = CMIOStreamClockCreate(kCFAllocatorDefault, CFSTR("ItsaClock"), (__bridge void *)self,  CMTimeMake(1, 10), 100, 10, &_clock);
+        OSStatus err = CMIOStreamClockCreate(kCFAllocatorDefault, CFSTR("CMIOMinimalSample::Stream::clock"), (__bridge void *)self,  CMTimeMake(1, 10), 100, 10, &_clock);
         if (err != noErr) {
             DLog(@"Error %d from CMIOStreamClockCreate", err);
         }
     }
     return _clock;
+}
+
+- (NSImage *)testImage {
+    if (_testImage == nil) {
+        NSBundle *bundle = [NSBundle bundleForClass:[self class]];
+        _testImage = [bundle imageForResource:@"hi"];
+    }
+    return _testImage;
 }
 
 - (CMSimpleQueueRef)copyBufferQueueWithAlteredProc:(CMIODeviceStreamQueueAlteredProc)alteredProc alteredRefCon:(void *)alteredRefCon {
@@ -124,23 +142,37 @@
         DLog(@"Queue is full, bailing out");
     }
 
-    NSBundle *bundle = [NSBundle bundleForClass:[self class]];
-    NSImage *myImage = [bundle imageForResource:@"hi"];
-    
-    CVPixelBufferRef pixelBuffer = [self CVPixelBufferRefFromUiImage:myImage];
-    CMTimeScale scale = CMTimeScale(NSEC_PER_SEC);
-    UInt64 time = mach_absolute_time();
-    CMTime pts = CMTimeMake(time, scale);
+    CVPixelBufferRef pixelBuffer = [self CVPixelBufferRefFromUiImage:self.testImage];
+    CMTimeScale scale = NSEC_PER_SEC;
+    CMTime hostTime = CMTimeMake(mach_absolute_time(), scale);
+    CMTime pts = hostTime;
     CMSampleTimingInfo timing;
-    timing.duration = kCMTimeInvalid;
+    timing.duration = CMTimeMake(1000, 1000 * 30);
     timing.presentationTimeStamp = pts;
     timing.decodeTimeStamp = kCMTimeInvalid;
-    
+    OSStatus err = CMIOStreamClockPostTimingEvent(timing.presentationTimeStamp, mach_absolute_time(), true, self.clock);
+    if (err != noErr) {
+        DLog(@"CMIOStreamClockPostTimingEvent err %d", err);
+    }
+
     CMFormatDescriptionRef format;
     CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &format);
-    
+
+    self.sequenceNumber = CMIOGetNextSequenceNumber(self.sequenceNumber);
+
     CMSampleBufferRef buffer;
-    CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pixelBuffer, format, &timing, &buffer);
+    err = CMIOSampleBufferCreateForImageBuffer(
+        kCFAllocatorDefault,
+        pixelBuffer,
+        format,
+        &timing,
+        self.sequenceNumber,
+        kCMIOSampleBufferNoDiscontinuities,
+        &buffer
+    );
+    if (err != noErr) {
+        DLog(@"CMIOSampleBufferCreateForImageBuffer err %d", err);
+    }
 
     CMSimpleQueueEnqueue(self.queue, buffer);
 
@@ -229,9 +261,7 @@
             *dataUsed = sizeof(UInt32);
             break;
         case kCMIOStreamPropertyFormatDescriptions:
-            CMVideoFormatDescriptionRef formatDescriptions[1];
-            formatDescriptions[0] = [self getFormatDescription];
-            *static_cast<CFArrayRef*>(data) = CFArrayCreate(kCFAllocatorDefault, (const void **)formatDescriptions, 1, &kCFTypeArrayCallBacks);
+            *static_cast<CFArrayRef*>(data) = (__bridge_retained CFArrayRef)[NSArray arrayWithObject:(__bridge_transfer NSObject *)[self getFormatDescription]];
             *dataUsed = sizeof(CFArrayRef);
             break;
         case kCMIOStreamPropertyFormatDescription:
@@ -247,19 +277,26 @@
             break;
         case kCMIOStreamPropertyFrameRate:
         case kCMIOStreamPropertyFrameRates:
-            *static_cast<Float64*>(data) = 30;
+            *static_cast<Float64*>(data) = 30.0;
             *dataUsed = sizeof(Float64);
             break;
         case kCMIOStreamPropertyMinimumFrameRate:
-            *static_cast<Float64*>(data) = 30;
+            *static_cast<Float64*>(data) = 30.0;
             *dataUsed = sizeof(Float64);
             break;
         case kCMIOStreamPropertyClock:
             *static_cast<CFTypeRef*>(data) = self.clock;
+            // This one was incredibly tricky and cost me many hours to find. It seems that DAL expects
+            // the clock to be retained when returned. It's unclear why, and that seems inconsistent
+            // with other properties that don't have the same behavior. But this is what Apple's sample
+            // code does.
+            // https://github.com/lvsti/CoreMediaIO-DAL-Example/blob/0392cb/Sources/Extras/CoreMediaIO/DeviceAbstractionLayer/Devices/DP/Properties/CMIO_DP_Property_Clock.cpp#L75
+            CFRetain(*static_cast<CFTypeRef*>(data));
             *dataUsed = sizeof(CFTypeRef);
             break;
         default:
             DLog(@"Stream unhandled getPropertyDataWithAddress for %@", [ObjectStore StringFromPropertySelector:address.mSelector]);
+            *dataUsed = 0;
     };
 }
 
